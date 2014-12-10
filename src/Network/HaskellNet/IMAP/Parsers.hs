@@ -321,11 +321,7 @@ pFetchLine =
        char ')'
        crlfP
        return $ Right $ (read num, pairs)
-    where pPair = do key <- (do k  <- anyChar `manyTill` char '['
-                                ps <- anyChar `manyTill` char ']'
-                                space
-                                return (k++"["++ps++"]"))
-                        <|> anyChar `manyTill` space
+    where pPair = do key <- anyChar `manyTill` space
                      value <- (do char '('
                                   v <- pParen `sepBy` space
                                   char ')'
