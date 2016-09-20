@@ -1,8 +1,54 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{- |
+
+This module provides functions for working with the SMTP protocol in the client side,
+including /opening/ and /closing/ connections, /sending commands/ to the server,
+/authenticate/ and /sending mails/.
+
+Here's a basic usage example:
+
+>
+> import Network.HaskellNet.SMTP
+> import Network.HaskellNet.Auth
+> import qualified Data.Text.Lazy as T
+>
+> main = doSMTP "your.smtp.server.com" $ \conn ->
+>    authSucceed <- authenticate PLAIN "username" "password" conn
+>    if authSucceed
+>        then sendPlainTextMail "receiver@server.com" "sender@server.com" "subject" (T.pack "Hello! This is the mail body!") conn
+>        else print "Authentication failed."
+
+Notes for the above example:
+
+   * First the 'SMTPConnection' is opened with the 'doSMTP' function.
+     The connection should also be established with functions such as 'connectSMTP',
+     'connectSMTPPort' and 'doSMTPPort'.
+     With the @doSMTP*@ functions the connection is opened, then executed an action
+     with it and then closed automatically.
+     If the connection is opened with the @connectSMTP*@ functions you may want to
+     close it with the 'closeSMTP' function after using it.
+     It is also possible to create a 'SMTPConnection' from an already opened connection
+     stream ('BSStream') using the 'connectStream' or 'doSMTPStream' functions.
+
+     /NOTE:/ For /SSL\/TLS/ support you may establish the connection using
+             the functions (such as @connectSMTPSSL@) provided in the
+             @Network.HaskellNet.SMTP.SSL@ module of the
+             <http://hackage.haskell.org/package/HaskellNet-SSL HaskellNet-SSL>
+             package.
+
+   * The 'authenticate' function authenticates to the server with the specified 'AuthType'.
+     'PLAIN', 'LOGIN' and 'CRAM_MD5' 'AuthType's are available. It returns a 'Bool'
+     indicating either the authentication succeed or not.
+
+
+   * To send a mail you can use 'sendPlainTextMail' for plain text mail, or 'sendMimeMail'
+     for mime mail.
+-}
 module Network.HaskellNet.SMTP
     ( -- * Types
       Command(..)
     , Response(..)
+    , AuthType(..)
     , SMTPConnection
       -- * Establishing Connection
     , connectSMTPPort
@@ -11,13 +57,16 @@ module Network.HaskellNet.SMTP
       -- * Operation to a Connection
     , sendCommand
     , closeSMTP
-      -- * Other Useful Operations 
+      -- * Other Useful Operations
     , authenticate
     , sendMail
     , doSMTPPort
     , doSMTP
     , doSMTPStream
+    , sendPlainTextMail
     , sendMimeMail
+    , sendMimeMail'
+    , sendMimeMail2
     )
     where
 
@@ -29,13 +78,11 @@ import Network
 
 import Control.Applicative ((<$>))
 import Control.Exception
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 
 import Data.Char (isDigit)
 
 import Network.HaskellNet.Auth
-
-import System.IO
 
 import Network.Mail.Mime
 import qualified Data.ByteString.Lazy as B
@@ -43,8 +90,6 @@ import qualified Data.ByteString as S
 
 import qualified Data.Text.Lazy as LT
 import qualified Data.Text as T
-
-import Prelude hiding (catch)
 
 -- The response field seems to be unused. It's saved at one place, but never
 -- retrieved.
@@ -111,7 +156,7 @@ tryCommand conn cmd tries expectedReply = do
     _ | code == expectedReply   -> return msg
     _ | tries > 1               ->
           tryCommand conn cmd (tries - 1) expectedReply
-    _ | otherwise               -> do
+      | otherwise               -> do
           bsClose (bsstream conn)
           fail $ "cannot execute command " ++ show cmd ++
                  ", expected reply code " ++ show expectedReply ++
@@ -137,7 +182,7 @@ parseResponse st =
                  let (c, bdy) = BS.span isDigit l
                  if not (BS.null bdy) && BS.head bdy == '-'
                     then do (c2, ls) <- readLines
-                            return (c2, (BS.tail bdy:ls))
+                            return (c2, BS.tail bdy:ls)
                     else return (c, [BS.tail bdy])
 
 
@@ -147,9 +192,12 @@ sendCommand (SMTPC conn _) (DATA dat) =
     do bsPutCrLf conn $ BS.pack "DATA"
        (code, _) <- parseResponse conn
        unless (code == 354) $ fail "this server cannot accept any data."
-       mapM_ sendLine $ BS.lines dat ++ [BS.pack "."]
+       mapM_ (sendLine . stripCR) $ BS.lines dat ++ [BS.pack "."]
        parseResponse conn
-    where sendLine l = bsPutCrLf conn l
+    where sendLine = bsPutCrLf conn
+          stripCR bs = case BS.unsnoc bs of
+                         Just (line, '\r') -> line
+                         _                 -> bs
 sendCommand (SMTPC conn _) (AUTH LOGIN username password) =
     do bsPutCrLf conn command
        (_, _) <- parseResponse conn
@@ -157,7 +205,7 @@ sendCommand (SMTPC conn _) (AUTH LOGIN username password) =
        (_, _) <- parseResponse conn
        bsPutCrLf conn $ BS.pack passB64
        parseResponse conn
-    where command = BS.pack $ "AUTH LOGIN"
+    where command = BS.pack "AUTH LOGIN"
           (userB64, passB64) = login username password
 sendCommand (SMTPC conn _) (AUTH at username password) =
     do bsPutCrLf conn command
@@ -184,7 +232,7 @@ sendCommand (SMTPC conn _) meth =
                       QUIT         -> "QUIT"
                       (DATA _)     ->
                           error "BUG: DATA pattern should be matched by sendCommand patterns"
-                      (AUTH _ _ _)     ->
+                      (AUTH {})     ->
                           error "BUG: AUTH pattern should be matched by sendCommand patterns"
 
 -- | close the connection.  This function send the QUIT method, so you
@@ -205,7 +253,16 @@ closeSMTP c@(SMTPC conn _) =
        bsClose conn `catch` \(_ :: IOException) -> return ()
 -}
 
--- | Authentication.
+{- |
+This function will return 'True' if the authentication succeeds.
+Here's an example of sending a mail with a server that requires
+authentication:
+
+>    authSucceed <- authenticate PLAIN "username" "password" conn
+>    if authSucceed
+>        then sendPlainTextMail "receiver@server.com" "sender@server.com" "subject" (T.pack "Hello!") conn
+>        else print "Authentication failed."
+-}
 authenticate :: AuthType -> UserName -> Password -> SMTPConnection -> IO Bool
 authenticate at username password conn  = do
         (code, _) <- sendCommand conn $ AUTH at username password
@@ -230,21 +287,42 @@ sendMail sender receivers dat conn = do
 -- | doSMTPPort open a connection, and do an IO action with the
 -- connection, and then close it.
 doSMTPPort :: String -> PortNumber -> (SMTPConnection -> IO a) -> IO a
-doSMTPPort host port execution =
-    bracket (connectSMTPPort host port) closeSMTP execution
+doSMTPPort host port =
+    bracket (connectSMTPPort host port) closeSMTP
 
 -- | doSMTP is similar to doSMTPPort, except that it does not require
 -- port number but connects to the server with port 25.
 doSMTP :: String -> (SMTPConnection -> IO a) -> IO a
-doSMTP host execution = doSMTPPort host 25 execution
+doSMTP host = doSMTPPort host 25
 
 -- | doSMTPStream is similar to doSMTPPort, except that its argument
 -- is a Stream data instead of hostname and port number.
 doSMTPStream :: BSStream -> (SMTPConnection -> IO a) -> IO a
-doSMTPStream s execution = bracket (connectStream s) closeSMTP execution
+doSMTPStream s = bracket (connectStream s) closeSMTP
 
-sendMimeMail :: String -> String -> String -> LT.Text
-             -> LT.Text -> [(T.Text, FilePath)] -> SMTPConnection -> IO ()
+-- | Send a plain text mail.
+sendPlainTextMail :: String  -- ^ receiver
+                  -> String  -- ^ sender
+                  -> String  -- ^ subject
+                  -> LT.Text -- ^ body
+                  -> SMTPConnection -- ^ the connection
+                  -> IO ()
+sendPlainTextMail to from subject body con = do
+    renderedMail <- renderMail' myMail
+    sendMail from [to] (lazyToStrict renderedMail) con
+    where
+        myMail = simpleMail' (address to) (address from) (T.pack subject) body
+        address = Address Nothing . T.pack
+
+-- | Send a mime mail. The attachments are included with the file path.
+sendMimeMail :: String               -- ^ receiver
+             -> String               -- ^ sender
+             -> String               -- ^ subject
+             -> LT.Text              -- ^ plain text body
+             -> LT.Text              -- ^ html body
+             -> [(T.Text, FilePath)] -- ^ attachments: [(content_type, path)]
+             -> SMTPConnection
+             -> IO ()
 sendMimeMail to from subject plainBody htmlBody attachments con = do
   myMail <- simpleMail (address to) (address from) (T.pack subject)
             plainBody htmlBody attachments
@@ -252,6 +330,31 @@ sendMimeMail to from subject plainBody htmlBody attachments con = do
   sendMail from [to] (lazyToStrict renderedMail) con
   where
     address = Address Nothing . T.pack
+
+-- | Send a mime mail. The attachments are included with in-memory 'ByteString'.
+sendMimeMail' :: String                         -- ^ receiver
+              -> String                         -- ^ sender
+              -> String                         -- ^ subject
+              -> LT.Text                        -- ^ plain text body
+              -> LT.Text                        -- ^ html body
+              -> [(T.Text, T.Text, B.ByteString)] -- ^ attachments: [(content_type, file_name, content)]
+              -> SMTPConnection
+              -> IO ()
+sendMimeMail' to from subject plainBody htmlBody attachments con = do
+  let myMail = simpleMailInMemory (address to) (address from) (T.pack subject)
+                                  plainBody htmlBody attachments
+  sendMimeMail2 myMail con
+  where
+    address = Address Nothing . T.pack
+
+sendMimeMail2 :: Mail -> SMTPConnection -> IO ()
+sendMimeMail2 mail con = do
+    let (Address _ from) = mailFrom mail
+        recps = map (T.unpack . addressEmail)
+                     $ (mailTo mail ++ mailCc mail ++ mailBcc mail)
+    when (null recps) $ fail "no receiver specified."
+    renderedMail <- renderMail' $ mail { mailBcc = [] }
+    sendMail (T.unpack from) recps (lazyToStrict renderedMail) con
 
 -- haskellNet uses strict bytestrings
 -- TODO: look at making haskellnet lazy

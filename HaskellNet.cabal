@@ -1,19 +1,20 @@
 Name:           HaskellNet
 Synopsis:       Client support for POP3, SMTP, and IMAP
-Description:	This package provides client support for the POP3,
+Description:    This package provides client support for the POP3,
                 SMTP, and IMAP protocols.  NOTE: this package will be
                 split into smaller, protocol-specific packages in the
                 future.
-Version:        0.4
+Version:        0.5.1
 Copyright:      (c) 2006 Jun Mukai
 Author:         Jun Mukai
-Maintainer:	Jonathan Daugherty <cygnus@foobox.com>
+Maintainer:     Jonathan Daugherty <cygnus@foobox.com>,
+                Leza Morais Lutonda <lemol-c@outlook.com>
 License:        BSD3
-License-file:	LICENSE
+License-file:   LICENSE
 Category:       Network
 Homepage:       https://github.com/jtdaugherty/HaskellNet
 Cabal-version:  >=1.6
-Build-type:	Simple
+Build-type:     Simple
 
 Extra-Source-Files:
   CHANGELOG
@@ -55,5 +56,5 @@ Library
     cryptohash,
     base64-string,
     old-time,
-    mime-mail >= 0.4.0 && < 0.5,
+    mime-mail >= 0.4.7 && < 0.5,
     text

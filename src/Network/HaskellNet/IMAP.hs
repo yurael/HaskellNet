@@ -12,12 +12,14 @@ module Network.HaskellNet.IMAP
       -- ** selected state commands
     , check, close, expunge
     , search, store, copy
+    , idle
       -- * fetch commands
     , fetch, fetchHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
     , fetchFlags, fetchR, fetchByString, fetchByStringR
       -- * other types
     , Flag(..), Attribute(..), MailboxStatus(..)
     , SearchQuery(..), FlagsQuery(..)
+    , A.AuthType(..)
     )
 where
 
@@ -86,7 +88,7 @@ instance Show SearchQuery where
               showQuery (NOTs qry)      = "NOT " ++ show qry
               showQuery OLDs            = "OLD"
               showQuery (ONs t)         = "ON " ++ dateToStringIMAP t
-              showQuery (ORs q1 q2)     = "OR " ++ show q1 ++ " " ++ show q2 
+              showQuery (ORs q1 q2)     = "OR " ++ show q1 ++ " " ++ show q2
               showQuery (SENTBEFOREs t) = "SENTBEFORE " ++ dateToStringIMAP t
               showQuery (SENTONs t)     = "SENTON " ++ dateToStringIMAP t
               showQuery (SENTSINCEs t)  = "SENTSINCE " ++ dateToStringIMAP t
@@ -168,7 +170,7 @@ getResponse s = unlinesCRLF <$> getLs
                                           return (l' : ls)
                      | isTagged l -> (l:) <$> getLs
                      | otherwise -> return [l]
-          getLiteral l len = 
+          getLiteral l len =
               do lit <- bsGet s len
                  l2 <- strip <$> bsGetLine s
                  let l' = BS.concat [l, crlfStr, lit, l2]
@@ -193,6 +195,26 @@ mboxUpdate conn (MboxUpdate exists' recent') = do
 -- IMAP commands
 --
 
+idle :: IMAPConnection -> Int -> IO ()
+idle conn timeout =
+    do
+        (buf',num) <- sendCommand' conn "IDLE"
+        buf <-
+            if BS.take 2 buf' == BS.pack "+ "
+                then do
+                    _ <- bsWaitForInput (stream conn) timeout
+                    bsPutCrLf (stream conn) $ BS.pack "DONE"
+                    getResponse $ stream conn
+                else
+                    return buf'
+        let (resp, mboxUp, value) = eval pNone (show6 num) buf
+        case resp of
+         OK _ _        -> do mboxUpdate conn mboxUp
+                             return value
+         NO _ msg      -> fail ("NO: " ++ msg)
+         BAD _ msg     -> fail ("BAD: " ++ msg)
+         PREAUTH _ msg -> fail ("preauth: " ++ msg)
+
 noop :: IMAPConnection -> IO ()
 noop conn = sendCommand conn "NOOP" pNone
 
@@ -204,7 +226,7 @@ logout c = do bsPutCrLf (stream c) $ BS.pack "a0001 LOGOUT"
               bsClose (stream c)
 
 login :: IMAPConnection -> A.UserName -> A.Password -> IO ()
-login conn username password = sendCommand conn ("LOGIN " ++ username ++ " " ++ password)
+login conn username password = sendCommand conn ("LOGIN " ++ (escapeLogin username) ++ " " ++ (escapeLogin password))
                                pNone
 
 authenticate :: IMAPConnection -> A.AuthType
@@ -243,8 +265,10 @@ authenticate conn at username password =
 
 _select :: String -> IMAPConnection -> String -> IO ()
 _select cmd conn mboxName =
-    do mbox' <- sendCommand conn (cmd ++ mboxName) pSelect
+    do mbox' <- sendCommand conn (cmd ++ quoted mboxName) pSelect
        setMailboxInfo conn $ mbox' { _mailbox = mboxName }
+    where
+       quoted s = "\"" ++ s ++ "\""
 
 select :: IMAPConnection -> MailboxName -> IO ()
 select = _select "SELECT "
@@ -338,36 +362,36 @@ searchCharset conn charset queries =
 fetch :: IMAPConnection -> UID -> IO ByteString
 fetch conn uid =
     do lst <- fetchByString conn uid "BODY[]"
-       return $ maybe BS.empty BS.pack $ lookup "BODY[]" lst
+       return $ maybe BS.empty BS.pack $ lookup' "BODY[]" lst
 
 fetchHeader :: IMAPConnection -> UID -> IO ByteString
 fetchHeader conn uid =
     do lst <- fetchByString conn uid "BODY[HEADER]"
-       return $ maybe BS.empty BS.pack $ lookup "BODY[HEADER]" lst
+       return $ maybe BS.empty BS.pack $ lookup' "BODY[HEADER]" lst
 
 fetchSize :: IMAPConnection -> UID -> IO Int
 fetchSize conn uid =
     do lst <- fetchByString conn uid "RFC822.SIZE"
-       return $ maybe 0 read $ lookup "RFC822.SIZE" lst
+       return $ maybe 0 read $ lookup' "RFC822.SIZE" lst
 
 fetchHeaderFields :: IMAPConnection
                   -> UID -> [String] -> IO ByteString
 fetchHeaderFields conn uid hs =
     do lst <- fetchByString conn uid ("BODY[HEADER.FIELDS "++unwords hs++"]")
        return $ maybe BS.empty BS.pack $
-              lookup ("BODY[HEADER.FIELDS "++unwords hs++"]") lst
+              lookup' ("BODY[HEADER.FIELDS "++unwords hs++"]") lst
 
 fetchHeaderFieldsNot :: IMAPConnection
                      -> UID -> [String] -> IO ByteString
 fetchHeaderFieldsNot conn uid hs =
     do let fetchCmd = "BODY[HEADER.FIELDS.NOT "++unwords hs++"]"
        lst <- fetchByString conn uid fetchCmd
-       return $ maybe BS.empty BS.pack $ lookup fetchCmd lst
+       return $ maybe BS.empty BS.pack $ lookup' fetchCmd lst
 
 fetchFlags :: IMAPConnection -> UID -> IO [Flag]
 fetchFlags conn uid =
     do lst <- fetchByString conn uid "FLAGS"
-       return $ getFlags $ lookup "FLAGS" lst
+       return $ getFlags $ lookup' "FLAGS" lst
     where getFlags Nothing  = []
           getFlags (Just s) = eval' dvFlags "" s
 
@@ -376,7 +400,7 @@ fetchR :: IMAPConnection -> (UID, UID)
 fetchR conn r =
     do lst <- fetchByStringR conn r "BODY[]"
        return $ map (\(uid, vs) -> (uid, maybe BS.empty BS.pack $
-                                       lookup "BODY[]" vs)) lst
+                                       lookup' "BODY[]" vs)) lst
 fetchByString :: IMAPConnection -> UID -> String
               -> IO [(String, String)]
 fetchByString conn uid command =
@@ -388,7 +412,7 @@ fetchByStringR :: IMAPConnection -> (UID, UID) -> String
 fetchByStringR conn (s, e) command =
     fetchCommand conn ("UID FETCH "++show s++":"++show e++" "++command) proc
     where proc (n, ps) =
-              (maybe (toEnum (fromIntegral n)) read (lookup "UID" ps), ps)
+              (maybe (toEnum (fromIntegral n)) read (lookup' "UID" ps), ps)
 
 fetchCommand :: IMAPConnection -> String
              -> ((Integer, [(String, String)]) -> b) -> IO [b]
@@ -406,8 +430,8 @@ storeFull conn uidstr query isSilent =
           flgs (PlusFlags fs)    = toFStr "+FLAGS" $ fstrs fs
           flgs (MinusFlags fs)   = toFStr "-FLAGS" $ fstrs fs
           procStore (n, ps) = (maybe (toEnum (fromIntegral n)) read
-                                         (lookup "UID" ps)
-                              ,maybe [] (eval' dvFlags "") (lookup "FLAG" ps))
+                                         (lookup' "UID" ps)
+                              ,maybe [] (eval' dvFlags "") (lookup' "FLAG" ps))
 
 
 store :: IMAPConnection -> UID -> FlagsQuery -> IO ()
@@ -450,3 +474,25 @@ crlf = BS.pack "\r\n"
 
 bsPutCrLf :: BSStream -> ByteString -> IO ()
 bsPutCrLf h s = bsPut h s >> bsPut h crlf >> bsFlush h
+
+lookup' :: String -> [(String, b)] -> Maybe b
+lookup' _ [] = Nothing
+lookup' q ((k,v):xs) | q == lastWord k  = return v
+                     | otherwise        = lookup' q xs
+    where
+        lastWord = last . words
+
+-- TODO: This is just a first trial solution for this stack overflow question:
+--       http://stackoverflow.com/questions/26183675/error-when-fetching-subject-from-email-using-haskellnets-imap
+--       It must be reviewed. References: rfc3501#6.2.3, rfc2683#3.4.2.
+--       This function was tested against the password: `~1!2@3#4$5%6^7&8*9(0)-_=+[{]}\|;:'",<.>/? (with spaces in the laterals).
+escapeLogin :: String -> String
+escapeLogin x = "\"" ++ replaceSpecialChars x ++ "\""
+    where
+        replaceSpecialChars ""     = ""
+        replaceSpecialChars (c:cs) = escapeChar c ++ replaceSpecialChars cs
+        escapeChar '"' = "\\\""
+        escapeChar '\\' = "\\\\"
+        escapeChar '{' = "\\{"
+        escapeChar '}' = "\\}"
+        escapeChar s   = [s]
